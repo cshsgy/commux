@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <poll.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -59,7 +60,22 @@ int wait_poll_ms() {
 // an event arrives, so latency is unchanged in the common case; the timeout
 // only caps idle sleep, keeping CPU near zero rather than busy-spinning
 // ucp_worker_progress().
+int spin_us() {
+  static const int us = [] {
+    const char* e = std::getenv("COMMUX_SPIN_US");
+    int v = e ? std::atoi(e) : 0;
+    return v > 0 ? v : 0;
+  }();
+  return us;
+}
+
 void worker_wait_timed(ucp_worker_h worker) {
+  auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - t0)
+             .count() < spin_us()) {
+    if (ucp_worker_progress(worker)) return;
+  }
   ucs_status_t s = ucp_worker_arm(worker);
   if (s == UCS_ERR_BUSY) return;  // events arrived during arm -> progress now
   if (s != UCS_OK) {
