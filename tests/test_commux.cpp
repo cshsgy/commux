@@ -16,6 +16,8 @@
 
 #include <torch/torch.h>
 
+#include <sys/resource.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -333,6 +335,71 @@ int main(int argc, char** argv) {
           "concurrent parked waits all wake (no lost wakeup)");
     done.store(true);
     watchdog.join();
+  }
+
+  // COMMUX_SPIN_US only. A peer drips unrelated messages for longer than the
+  // spin window, then sends the message this rank is blocked on. The whole
+  // wait gets one window, so CPU time stays near that budget. Default-off
+  // runs skip this.
+  if (const char* spin_env = std::getenv("COMMUX_SPIN_US");
+      spin_env != nullptr && std::atoi(spin_env) > 0 && size == 2) {
+    const int peer = 1 - rank;
+    const int n_noise = 40;
+    const int gap_ms = 3;
+    const int target_tag = 9100;
+    std::vector<at::Tensor> noise_bufs;
+    std::vector<c10::intrusive_ptr<c10d::Work>> noise_works;
+    at::Tensor target;
+    c10::intrusive_ptr<c10d::Work> target_work;
+    if (rank == 0) {
+      target = torch::zeros({8}, f64);
+      std::vector<at::Tensor> tv{target};
+      target_work = pg->recv(tv, peer, target_tag);
+      for (int i = 0; i < n_noise; ++i) {
+        noise_bufs.push_back(torch::zeros({8}, f64));
+        std::vector<at::Tensor> v{noise_bufs.back()};
+        noise_works.push_back(pg->recv(v, peer, 9200 + i));
+      }
+    }
+    pg->barrier()->wait();
+    if (rank == 0) {
+      struct rusage ru0 {};
+      struct rusage ru1 {};
+      getrusage(RUSAGE_THREAD, &ru0);
+      auto wall0 = std::chrono::steady_clock::now();
+      target_work->wait();
+      long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - wall0)
+                         .count();
+      getrusage(RUSAGE_THREAD, &ru1);
+      auto usec = [](const timeval& t) {
+        return static_cast<long>(t.tv_sec) * 1000000L +
+               static_cast<long>(t.tv_usec);
+      };
+      long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
+                    (usec(ru1.ru_stime) - usec(ru0.ru_stime));
+      for (auto& w : noise_works) w->wait();
+      bool value_ok = target.eq(42.0).all().item<bool>();
+      long budget_us = std::atol(spin_env);
+      long drip_us = static_cast<long>(n_noise) * gap_ms * 1000L;
+      // A window longer than the drip spins until the message arrives.
+      bool parked = budget_us * 2 >= drip_us ||
+                    (wall_ms * 1000 > drip_us / 2 && cpu_us * 2 < wall_ms * 1000);
+      std::printf("  spin check: wall %ld ms, cpu %ld us, budget %s us\n",
+                  wall_ms, cpu_us, spin_env);
+      check(value_ok && parked,
+            "bounded spin parks while unrelated traffic flows");
+    } else {
+      for (int i = 0; i < n_noise; ++i) {
+        auto s = torch::full({8}, 1.0, f64);
+        std::vector<at::Tensor> v{s};
+        pg->send(v, peer, 9200 + i)->wait();
+        std::this_thread::sleep_for(std::chrono::milliseconds(gap_ms));
+      }
+      auto s = torch::full({8}, 42.0, f64);
+      std::vector<at::Tensor> v{s};
+      pg->send(v, peer, target_tag)->wait();
+    }
   }
 
   pg->barrier()->wait();

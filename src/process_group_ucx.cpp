@@ -69,12 +69,34 @@ int spin_us() {
   return us;
 }
 
-void worker_wait_timed(ucp_worker_h worker) {
-  auto t0 = std::chrono::steady_clock::now();
-  while (std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now() - t0)
-             .count() < spin_us()) {
-    if (ucp_worker_progress(worker)) return;
+// One budget per wait(). Re-entries after an unrelated completion keep `end`,
+// so the total spin is COMMUX_SPIN_US however many completions arrive.
+struct SpinBudget {
+  bool on = false;
+  std::chrono::steady_clock::time_point end{};
+  const std::chrono::steady_clock::time_point* deadline() const {
+    return on ? &end : nullptr;
+  }
+  static SpinBudget start() {
+    SpinBudget b;
+    int us = spin_us();
+    if (us > 0) {
+      b.on = true;
+      b.end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    }
+    return b;
+  }
+};
+
+// `deadline` is the end of this wait's whole spin budget. Unrelated
+// completions return early so the caller can reap, and the same deadline is
+// passed back in. A null deadline (COMMUX_SPIN_US unset or 0) does not spin.
+void worker_wait_timed(ucp_worker_h worker,
+                       const std::chrono::steady_clock::time_point* deadline) {
+  if (deadline != nullptr) {
+    while (std::chrono::steady_clock::now() < *deadline) {
+      if (ucp_worker_progress(worker)) return;
+    }
   }
   ucs_status_t s = ucp_worker_arm(worker);
   if (s == UCS_ERR_BUSY) return;  // events arrived during arm -> progress now
@@ -290,12 +312,13 @@ class UCXWork : public c10d::Work {
     // worker -- their progress is precisely what completes this Work. (Holding
     // the mutex across a blocking ucp_worker_wait() would serialize, and can
     // deadlock, multi-threaded consumers such as snapy.)
+    SpinBudget spin = SpinBudget::start();
     while (!reap()) {
       if (ucp_worker_progress(worker_)) continue;  // advanced; re-check
       // Idle: sleep on the worker's wakeup fd, but only until the next event or
       // a short timeout -- a bounded sleep so concurrently parked threads can't
       // miss a lost wakeup on the shared worker (see worker_wait_timed).
-      worker_wait_timed(worker_);
+      worker_wait_timed(worker_, spin.deadline());
     }
     if (err_) {
       std::rethrow_exception(err_);
@@ -517,9 +540,10 @@ void ProcessGroupUCX::wait_request(void* req) {
   // wakeup fd (bounded, to avoid the lost-wakeup deadlock -- see
   // worker_wait_timed) instead of busy-spinning. Caller holds worker_mu_.
   ucs_status_t st;
+  SpinBudget spin = SpinBudget::start();
   while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
     if (ucp_worker_progress(worker_)) continue;
-    worker_wait_timed(worker_);
+    worker_wait_timed(worker_, spin.deadline());
   }
   ucp_request_free(req);
   TORCH_CHECK(st == UCS_OK, "commux request failed: ", ucs_status_string(st));
