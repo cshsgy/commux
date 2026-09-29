@@ -14,9 +14,8 @@
 //   test_commux <rank> <world_size> [master_host=127.0.0.1] [master_port=29555]
 //   UCXPG_DEVICE=cuda  runs the same checks on GPU tensors.
 
-#include <torch/torch.h>
-
 #include <sys/resource.h>
+#include <torch/torch.h>
 
 #include <atomic>
 #include <chrono>
@@ -363,8 +362,8 @@ int main(int argc, char** argv) {
     }
     pg->barrier()->wait();
     if (rank == 0) {
-      struct rusage ru0 {};
-      struct rusage ru1 {};
+      struct rusage ru0{};
+      struct rusage ru1{};
       getrusage(RUSAGE_THREAD, &ru0);
       auto wall0 = std::chrono::steady_clock::now();
       target_work->wait();
@@ -383,8 +382,8 @@ int main(int argc, char** argv) {
       long budget_us = std::atol(spin_env);
       long drip_us = static_cast<long>(n_noise) * gap_ms * 1000L;
       // A window longer than the drip spins until the message arrives.
-      bool parked = budget_us * 2 >= drip_us ||
-                    (wall_ms * 1000 > drip_us / 2 && cpu_us * 2 < wall_ms * 1000);
+      bool parked = budget_us * 2 >= drip_us || (wall_ms * 1000 > drip_us / 2 &&
+                                                 cpu_us * 2 < wall_ms * 1000);
       std::printf("  spin check: wall %ld ms, cpu %ld us, budget %s us\n",
                   wall_ms, cpu_us, spin_env);
       check(value_ok && parked,
