@@ -94,10 +94,11 @@ jobs:
             -C cmake.define.COMMUX_UCX_PROVIDER=system \
             -C cmake.define.COMMUX_CUDA=OFF .
 
-      - name: Smoke import + end-to-end backend test (CPU, 2 ranks)
+      - name: Smoke import + end-to-end backend tests (CPU, 2-4 ranks)
         run: |
           python -c "import commux; commux.register(); print('commux import OK')"
           torchrun --standalone --nnodes=1 --nproc-per-node=2 tests/test_torch_dist.py
+          for n in 3 4; do torchrun --standalone --nnodes=1 --nproc-per-node=$n tests/test_collectives.py; done
 
       - name: C++ test (2 ranks over TCPStore)
         run: |
