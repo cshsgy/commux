@@ -34,7 +34,7 @@ if(NOT Python3_EXECUTABLE)
 endif()
 execute_process(
   COMMAND "${Python3_EXECUTABLE}" -c
-    "import torch,os;print(os.path.dirname(torch.__file__));print(int(torch._C._GLIBCXX_USE_CXX11_ABI));print(int(torch.version.cuda is not None))"
+    "import torch,os;print(os.path.dirname(torch.__file__));print(int(torch._C._GLIBCXX_USE_CXX11_ABI));print(int(torch.version.cuda is not None));print('abi='+getattr(torch._C,'_PYBIND11_BUILD_ABI',''))"
   OUTPUT_VARIABLE _torch_info OUTPUT_STRIP_TRAILING_WHITESPACE
   RESULT_VARIABLE _torch_probe)
 if(NOT _torch_probe EQUAL 0)
@@ -44,6 +44,9 @@ string(REPLACE "\n" ";" _torch_lines "${_torch_info}")
 list(GET _torch_lines 0 TORCH_INSTALL_PREFIX)
 list(GET _torch_lines 1 _torch_abi)
 list(GET _torch_lines 2 _torch_has_cuda)
+# torch builds its pybind11 2.x extensions with this tag; empty on pybind11 3
+list(GET _torch_lines 3 _torch_pybind_abi)
+string(REPLACE "abi=" "" _torch_pybind_abi "${_torch_pybind_abi}")
 
 set(TORCH_INCLUDE_DIRS
   "${TORCH_INSTALL_PREFIX}/include"
@@ -188,6 +191,10 @@ if(COMMUX_BUILD_PYTHON)
     commux ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
   target_include_directories(commux_pybind SYSTEM PRIVATE
     ${TORCH_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+  if(_torch_pybind_abi)  # else torch's c10d types are invisible to this module
+    target_compile_definitions(commux_pybind PRIVATE
+      PYBIND11_BUILD_ABI="${_torch_pybind_abi}")
+  endif()
   set_target_properties(commux_pybind PROPERTIES
     BUILD_RPATH "$ORIGIN/lib:${UCX_LIBRARY_DIR}"
     INSTALL_RPATH "$ORIGIN/lib:$ORIGIN:${UCX_LIBRARY_DIR}")
