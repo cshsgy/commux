@@ -690,43 +690,51 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::recvAnysource(
       tensors, source_rank);
 }
 
-// -------------------------------------------------------------------------
-// Collectives (linear reduce-to-root + broadcast over tagged p2p).
-// Correctness-first; recursive-doubling is a future optimization. Typical
-// payloads (timestep / diagnostics) are tiny, so linear is fine.
-// -------------------------------------------------------------------------
+// Collectives: binomial tree over tagged p2p; 2*ceil(log2(P)) messages/rank.
 
 void ProcessGroupUCX::reduce_locked(std::vector<at::Tensor>& tensors,
                                     c10d::ReduceOp op, int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux reduce: root out of range");
+  int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
     TORCH_CHECK(t.is_contiguous(), "commux reduce: tensor must be contiguous");
-    if (rank_ == root) {
-      at::Tensor tmp = at::empty_like(t);
-      for (int r = 0; r < size_; ++r) {
-        if (r == root) continue;
-        coll_recv(tmp, r, static_cast<uint32_t>(i));
-        apply_reduce(t, tmp, op);
+    at::Tensor acc = t, tmp;
+    for (int mask = 1; mask < size_; mask <<= 1) {
+      if (vrank & mask) {
+        coll_send(acc, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
+        break;
       }
-    } else {
-      coll_send(t, root, static_cast<uint32_t>(i));
+      if (vrank + mask < size_) {
+        if (!tmp.defined()) {
+          tmp = at::empty_like(t);
+          if (vrank != 0) acc = t.clone();
+        }
+        coll_recv(tmp, (vrank + mask + root) % size_, static_cast<uint32_t>(i));
+        apply_reduce(acc, tmp, op);
+      }
     }
   }
 }
 
 void ProcessGroupUCX::broadcast_locked(std::vector<at::Tensor>& tensors,
                                        int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux broadcast: root out of range");
+  int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
     TORCH_CHECK(t.is_contiguous(),
                 "commux broadcast: tensor must be contiguous");
-    if (rank_ == root) {
-      for (int r = 0; r < size_; ++r) {
-        if (r == root) continue;
-        coll_send(t, r, static_cast<uint32_t>(i));
+    int mask = 1;
+    for (; mask < size_; mask <<= 1) {
+      if (vrank & mask) {
+        coll_recv(t, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
+        break;
       }
-    } else {
-      coll_recv(t, root, static_cast<uint32_t>(i));
+    }
+    for (mask >>= 1; mask > 0; mask >>= 1) {
+      if (vrank + mask < size_)
+        coll_send(t, (vrank + mask + root) % size_, static_cast<uint32_t>(i));
     }
   }
 }
