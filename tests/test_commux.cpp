@@ -17,8 +17,10 @@
 #include <sys/resource.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -466,6 +468,69 @@ int main(int argc, char** argv) {
       auto s = torch::full({8}, static_cast<double>(n), f64);
       std::vector<at::Tensor> v{s};
       pg->send(v, peer, flood_target)->wait();
+    }
+  }
+
+  // COMMUX_LATE only. A wait that already outlasted COMMUX_SPIN_US must not
+  // sit for another COMMUX_WAIT_POLL_MS after the request has completed. The
+  // peer holds the message until this rank's budget is expired and the wait
+  // is parked; the payload is the sender's steady_clock in microseconds,
+  // which is the same CLOCK_MONOTONIC on one host. Red on 0994e4e: the
+  // median is about one poll. COMMUX_WAIT_POLL_MS must be >= 10 so one poll
+  // is larger than localhost noise. spin_us() and wait_poll_ms() cache the
+  // environment on first use, so both variables have to be set at process
+  // start, before any wait.
+  if (const char* late = std::getenv("COMMUX_LATE");
+      late != nullptr && std::atoi(late) > 0 && size == 2) {
+    const char* poll_env = std::getenv("COMMUX_WAIT_POLL_MS");
+    const char* spin_env = std::getenv("COMMUX_SPIN_US");
+    int poll_ms = poll_env != nullptr ? std::atoi(poll_env) : 1;
+    if (poll_ms <= 0) poll_ms = 1;
+    long spin_us = spin_env != nullptr ? std::atol(spin_env) : 0;
+    const int peer = 1 - rank;
+    const int trials = 11;
+    // Stay parked for longer than the budget before the message exists.
+    const int hold_ms = static_cast<int>(spin_us / 1000L) + 8;
+    auto steady_us = []() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+    if (rank == 0) {
+      check(spin_us > 0, "COMMUX_LATE requires COMMUX_SPIN_US > 0");
+      check(poll_ms >= 10, "COMMUX_LATE requires COMMUX_WAIT_POLL_MS >= 10");
+      std::vector<long> lates;
+      lates.reserve(static_cast<size_t>(trials));
+      for (int i = 0; i < trials; ++i) {
+        auto got = torch::empty({1}, f64);
+        std::vector<at::Tensor> tv{got};
+        auto work = pg->recv(tv, peer, 9700 + i);
+        pg->barrier()->wait();
+        work->wait();
+        long done = steady_us();
+        long sent = std::llround(got[0].item<double>());
+        lates.push_back(done - sent);
+      }
+      std::sort(lates.begin(), lates.end());
+      long median = lates[lates.size() / 2];
+      long lo = lates.front();
+      long hi = lates.back();
+      std::printf(
+          "  late poll: median %ld us, min %ld us, max %ld us, poll %d ms, "
+          "hold %d ms, spin %ld us, n %d\n",
+          median, lo, hi, poll_ms, hold_ms, spin_us, trials);
+      // Half a poll leaves room for scheduling noise and still rejects a
+      // wait that parked for a full COMMUX_WAIT_POLL_MS after completion.
+      check(lo > 0 && median * 2 < static_cast<long>(poll_ms) * 1000L,
+            "wait past the spin budget does not pay another poll");
+    } else {
+      for (int i = 0; i < trials; ++i) {
+        pg->barrier()->wait();
+        std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+        auto sent = torch::full({1}, static_cast<double>(steady_us()), f64);
+        std::vector<at::Tensor> v{sent};
+        pg->send(v, peer, 9700 + i)->wait();
+      }
     }
   }
 

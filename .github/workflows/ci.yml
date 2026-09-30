@@ -109,3 +109,19 @@ jobs:
           ./build/test_commux 1 2 127.0.0.1 29555 &
           ./build/test_commux 0 2 127.0.0.1 29555
           wait
+
+      - name: C++ late-poll regression (2 ranks, spin budget set)
+        run: |
+          # A wait past COMMUX_SPIN_US must not pay another COMMUX_WAIT_POLL_MS
+          # after the request has already completed. Poll is 20 ms so one extra
+          # park is larger than localhost noise. Rank 0's status is the check.
+          export COMMUX_SPIN_US=1000 COMMUX_WAIT_POLL_MS=20 COMMUX_LATE=1
+          ./build/test_commux 1 2 127.0.0.1 29556 &
+          pid=$!
+          set +e
+          ./build/test_commux 0 2 127.0.0.1 29556
+          status0=$?
+          wait "$pid"
+          status1=$?
+          set -e
+          test "$status0" -eq 0 -a "$status1" -eq 0
