@@ -456,31 +456,55 @@ int main(int argc, char** argv) {
       const char* poll_env = std::getenv("COMMUX_WAIT_POLL_MS");
       int poll_ms = poll_env != nullptr ? std::atoi(poll_env) : 1;
       if (poll_ms <= 0) poll_ms = 1;
+      long flood_us = std::llround(flood_got[1].item<double>()) -
+                      std::llround(flood_got[2].item<double>());
       std::printf(
           "  spin flood: wall %ld ms, cpu %ld us, budget %ld us, n %d, "
-          "target %ld us, poll %d ms\n",
-          wall_ms, cpu_us, budget_us, n, target_late, poll_ms);
+          "target %ld us, flood %ld us, poll %d ms\n",
+          wall_ms, cpu_us, budget_us, n, target_late, flood_us, poll_ms);
       check(
           n > 0 && parked,
           "bounded spin parks while unrelated completions arrive back to back");
-      // target_late is the stamped target waiting behind the unexpected
-      // queue. One poll between progress calls keeps the core parked, and
-      // that latency grows with the queue, so it is not capped at one poll.
+      // Bound the drain by the sender's own flood, not a fixed 250 ms.
+      // k = 4 and three polls: on the pinned tcp,sm,self runs the worst
+      // target still sits under half this bound, while n polls (one per
+      // queued message) is several seconds and fails it.
+      // TCP-only finishes the 40 ms window without blocking the sender, then
+      // drains a much deeper queue, so this ratio is an sm bound. The
+      // TCP-only job asserts the park check above, which is what was red.
+      const char* tls = std::getenv("UCX_TLS");
+      bool sm_bound =
+          tls == nullptr || std::string(tls).find("sm") != std::string::npos;
+      if (sm_bound && poll_ms == 20 && flood_us > 0) {
+        constexpr long k_p2p = 4;
+        long bound_us = k_p2p * flood_us + 3L * poll_ms * 1000L;
+        std::printf("  spin flood bound: target %ld us, bound %ld us, k %ld\n",
+                    target_late, bound_us, k_p2p);
+        check(target_late > 0 && target_late < bound_us,
+              "flood target stays within 4x the flood plus three polls");
+      }
     } else {
       int n = 0;
-      auto end = std::chrono::steady_clock::now() +
-                 std::chrono::milliseconds(flood_ms);
+      auto flood_start = std::chrono::steady_clock::now();
+      auto end = flood_start + std::chrono::milliseconds(flood_ms);
       while (std::chrono::steady_clock::now() < end && n < flood_max) {
         auto s = torch::full({8}, 1.0, f64);
         std::vector<at::Tensor> v{s};
         pg->send(v, peer, 9500 + n)->wait();
         ++n;
       }
+      auto stamp = []() {
+        return static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+      };
       auto s = torch::zeros({8}, f64);
       s[0] = static_cast<double>(n);
-      s[1] = static_cast<double>(
+      s[1] = stamp();
+      s[2] = static_cast<double>(
           std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now().time_since_epoch())
+              flood_start.time_since_epoch())
               .count());
       std::vector<at::Tensor> v{s};
       pg->send(v, peer, flood_target)->wait();
@@ -607,7 +631,7 @@ int main(int argc, char** argv) {
         struct rusage ru1{};
         getrusage(RUSAGE_THREAD, &ru0);
         auto wall0 = std::chrono::steady_clock::now();
-        auto t = torch::zeros({1}, f64);
+        auto t = torch::zeros({2}, f64);
         std::vector<at::Tensor> v{t};
         c10d::AllreduceOptions o;
         o.reduceOp = c10d::ReduceOp::SUM;
@@ -619,6 +643,7 @@ int main(int argc, char** argv) {
         long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
                       (usec(ru1.ru_stime) - usec(ru0.ru_stime));
         int n = static_cast<int>(t[0].item<double>());
+        long flood_us = std::llround(t[1].item<double>());
         std::vector<at::Tensor> bufs;
         std::vector<c10::intrusive_ptr<c10d::Work>> works;
         for (int j = 0; j < n; ++j) {
@@ -629,27 +654,181 @@ int main(int argc, char** argv) {
         for (auto& w : works) w->wait();
         bool parked = cpu_us * 2 < wall_us && wall_us > spin_us;
         std::printf(
-            "  collective flood: wall %ld us, cpu %ld us, spin %ld us, n %d\n",
-            wall_us, cpu_us, spin_us, n);
+            "  collective flood: wall %ld us, cpu %ld us, spin %ld us, "
+            "flood %ld us, n %d\n",
+            wall_us, cpu_us, spin_us, flood_us, n);
         check(n > 0 && parked,
               "collective wait parks while unrelated p2p arrivals come in");
+        // Separate from the p2p drain bound. The collective wall includes
+        // the peer's flood; k = 6 still leaves twice the pinned worst case
+        // and rejects a wait of one poll per queued message.
+        const char* tls_c = std::getenv("UCX_TLS");
+        bool sm_bound = tls_c == nullptr ||
+                        std::string(tls_c).find("sm") != std::string::npos;
+        if (sm_bound && poll_ms == 20 && flood_us > 0) {
+          constexpr long k_coll = 6;
+          long bound_us = k_coll * flood_us + 3L * poll_ms * 1000L;
+          std::printf(
+              "  collective flood bound: wall %ld us, bound %ld us, k %ld\n",
+              wall_us, bound_us, k_coll);
+          check(wall_us < bound_us,
+                "collective flood stays within 6x the flood plus three polls");
+        }
       } else {
         pg->barrier()->wait();
         int n = 0;
-        auto end = std::chrono::steady_clock::now() +
-                   std::chrono::milliseconds(flood_ms);
+        auto flood_start = std::chrono::steady_clock::now();
+        auto end = flood_start + std::chrono::milliseconds(flood_ms);
         while (std::chrono::steady_clock::now() < end && n < flood_max) {
           auto s = torch::full({8}, 1.0, f64);
           std::vector<at::Tensor> v{s};
           pg->send(v, peer, 110000 + n)->wait();
           ++n;
         }
-        auto t = torch::full({1}, static_cast<double>(n), f64);
+        long flood_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - flood_start)
+                            .count();
+        auto t = torch::zeros({2}, f64);
+        t[0] = static_cast<double>(n);
+        t[1] = static_cast<double>(flood_us);
         std::vector<at::Tensor> v{t};
         c10d::AllreduceOptions o;
         o.reduceOp = c10d::ReduceOp::SUM;
         pg->allreduce(v, o)->wait();
       }
+    }
+
+    // Non-coalesced multi-request Work. COMMUX_GROUP puts two recvs in one
+    // Work and COMMUX_COALESCE stays off, so the flush posts one ucp request
+    // each rather than an IOV. The second message is sent 1 ms after the
+    // first. A mistaken poll on that gap shows up near 20 ms; half a poll
+    // rejects it.
+    if (group_on) {
+      const int peer_m = 1;
+      if (rank == 0) {
+        pg->startCoalescing();
+        auto a = torch::empty({1}, f64);
+        auto b = torch::empty({1}, f64);
+        std::vector<at::Tensor> va{a};
+        std::vector<at::Tensor> vb{b};
+        pg->recv(va, peer_m, 14101);
+        pg->recv(vb, peer_m, 14102);
+        auto w = pg->endCoalescing();
+        pg->barrier()->wait();
+        w->wait();
+        long done = steady_us();
+        long late_b = done - std::llround(b[0].item<double>());
+        std::printf(
+            "  multi-request: first %ld us, second %ld us, poll %d ms\n",
+            static_cast<long>(done - std::llround(a[0].item<double>())), late_b,
+            poll_ms);
+        check(late_b > 0 && late_b * 2 < static_cast<long>(poll_ms) * 1000L,
+              "second request in one Work stays under half a poll");
+      } else {
+        pg->barrier()->wait();
+        auto first = torch::full({1}, static_cast<double>(steady_us()), f64);
+        std::vector<at::Tensor> fa{first};
+        pg->send(fa, 0, 14101)->wait();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto second = torch::full({1}, static_cast<double>(steady_us()), f64);
+        std::vector<at::Tensor> fb{second};
+        pg->send(fb, 0, 14102)->wait();
+      }
+    }
+
+    // 64 outstanding 256 KiB sends while the peer does not progress for
+    // 80 ms. The ack wait must park (cpu under half the wall), not spin.
+    {
+      const int nsend = 64;
+      const int count = 32768;
+      pg->barrier()->wait();
+      if (rank == 0) {
+        std::vector<at::Tensor> held;
+        std::vector<c10::intrusive_ptr<c10d::Work>> posted;
+        held.reserve(static_cast<size_t>(nsend));
+        for (int i = 0; i < nsend; ++i) {
+          held.push_back(torch::ones({count}, f64));
+          std::vector<at::Tensor> one{held.back()};
+          posted.push_back(pg->send(one, peer, 15000 + i));
+        }
+        auto ack = torch::empty({1}, f64);
+        std::vector<at::Tensor> av{ack};
+        auto w = pg->recv(av, peer, 15999);
+        struct rusage ru0{};
+        struct rusage ru1{};
+        auto usec = [](const timeval& t) {
+          return static_cast<long>(t.tv_sec) * 1000000L +
+                 static_cast<long>(t.tv_usec);
+        };
+        getrusage(RUSAGE_THREAD, &ru0);
+        auto wall0 = std::chrono::steady_clock::now();
+        w->wait();
+        long wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - wall0)
+                           .count();
+        getrusage(RUSAGE_THREAD, &ru1);
+        long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
+                      (usec(ru1.ru_stime) - usec(ru0.ru_stime));
+        std::printf("  fifo wait: wall %ld us, cpu %ld us, n %d\n", wall_us,
+                    cpu_us, nsend);
+        check(cpu_us * 2 < wall_us && wall_us > spin_us,
+              "outstanding sends to a stalled peer stay parked");
+        for (auto& p : posted) p->wait();
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        for (int i = 0; i < nsend; ++i) {
+          auto buf = torch::empty({count}, f64);
+          std::vector<at::Tensor> one{buf};
+          pg->recv(one, 0, 15000 + i)->wait();
+        }
+        auto ack = torch::ones({1}, f64);
+        std::vector<at::Tensor> av{ack};
+        pg->send(av, 0, 15999)->wait();
+      }
+    }
+  }
+
+  // COMMUX_GROUP two-peer Work, 3 ranks. Same half-poll assert as the
+  // two-request case above. Rank 2 sends 1 ms after rank 1.
+  if (const char* late3 = std::getenv("COMMUX_LATE");
+      late3 != nullptr && std::atoi(late3) > 0 && size == 3 && group_on) {
+    const char* poll_env = std::getenv("COMMUX_WAIT_POLL_MS");
+    int poll_ms = poll_env != nullptr ? std::atoi(poll_env) : 1;
+    if (poll_ms <= 0) poll_ms = 1;
+    auto steady_us = []() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+    if (rank == 0) {
+      pg->startCoalescing();
+      auto a = torch::empty({1}, f64);
+      auto b = torch::empty({1}, f64);
+      std::vector<at::Tensor> va{a};
+      std::vector<at::Tensor> vb{b};
+      pg->recv(va, /*src=*/1, /*tag=*/14001);
+      pg->recv(vb, /*src=*/2, /*tag=*/14002);
+      auto w = pg->endCoalescing();
+      pg->barrier()->wait();
+      w->wait();
+      long done = steady_us();
+      long late_b = done - std::llround(b[0].item<double>());
+      std::printf("  multi two-peer: first %ld us, second %ld us, poll %d ms\n",
+                  static_cast<long>(done - std::llround(a[0].item<double>())),
+                  static_cast<long>(late_b), poll_ms);
+      check(late_b > 0 && late_b * 2 < static_cast<long>(poll_ms) * 1000L,
+            "second peer in one Work stays under half a poll");
+    } else if (rank == 1) {
+      pg->barrier()->wait();
+      auto payload = torch::full({1}, static_cast<double>(steady_us()), f64);
+      std::vector<at::Tensor> p{payload};
+      pg->send(p, 0, 14001)->wait();
+    } else {
+      pg->barrier()->wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      auto payload = torch::full({1}, static_cast<double>(steady_us()), f64);
+      std::vector<at::Tensor> p{payload};
+      pg->send(p, 0, 14002)->wait();
     }
   }
 

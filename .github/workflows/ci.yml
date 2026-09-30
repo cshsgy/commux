@@ -133,3 +133,58 @@ jobs:
           status1=$?
           set -e
           test "$status0" -eq 0 -a "$status1" -eq 0
+
+      - name: C++ flood park on TCP only (spin budget set)
+        env:
+          UCX_TLS: tcp
+        run: |
+          # Same park check as the shared-memory flood. On 4045268 a TCP-only
+          # worker spun here (poll returned immediately, arm never BUSY).
+          export COMMUX_SPIN_US=1000 COMMUX_WAIT_POLL_MS=20 COMMUX_LATE=1
+          timeout 300 taskset -c 0,1 ./build/test_commux 1 2 127.0.0.1 29560 &
+          pid=$!
+          set +e
+          timeout 300 taskset -c 0,1 ./build/test_commux 0 2 127.0.0.1 29560
+          status0=$?
+          wait "$pid"
+          status1=$?
+          set -e
+          test "$status0" -eq 0 -a "$status1" -eq 0
+
+      - name: C++ multi-request wait (2 ranks, grouping on)
+        env:
+          UCX_TLS: tcp,sm,self
+        run: |
+          # Two ucp requests in one Work, second message 1 ms later.
+          # COMMUX_COALESCE stays off, so this is not an IOV.
+          export COMMUX_SPIN_US=1000 COMMUX_WAIT_POLL_MS=20 COMMUX_LATE=1
+          export COMMUX_GROUP=1
+          timeout 300 taskset -c 0,1 ./build/test_commux 1 2 127.0.0.1 29561 &
+          pid=$!
+          set +e
+          timeout 300 taskset -c 0,1 ./build/test_commux 0 2 127.0.0.1 29561
+          status0=$?
+          wait "$pid"
+          status1=$?
+          set -e
+          test "$status0" -eq 0 -a "$status1" -eq 0
+
+      - name: C++ multi-request wait (3 ranks, two peers)
+        env:
+          UCX_TLS: tcp,sm,self
+        run: |
+          export COMMUX_SPIN_US=1000 COMMUX_WAIT_POLL_MS=20 COMMUX_LATE=1
+          export COMMUX_GROUP=1
+          timeout 300 taskset -c 0,1 ./build/test_commux 1 3 127.0.0.1 29562 &
+          pid1=$!
+          timeout 300 taskset -c 0,1 ./build/test_commux 2 3 127.0.0.1 29562 &
+          pid2=$!
+          set +e
+          timeout 300 taskset -c 0,1 ./build/test_commux 0 3 127.0.0.1 29562
+          status0=$?
+          wait "$pid1"
+          status1=$?
+          wait "$pid2"
+          status2=$?
+          set -e
+          test "$status0" -eq 0 -a "$status1" -eq 0 -a "$status2" -eq 0

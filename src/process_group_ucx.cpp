@@ -95,14 +95,16 @@ struct SpinBudget {
 // completions return early so the caller can reap, and the same deadline is
 // passed back in. A null deadline (COMMUX_SPIN_US unset or 0) does not spin.
 // `park_on_busy`: UCS_ERR_BUSY means events are already queued, so arm will
-// not block on the wakeup fd. The p2p throttle (unrelated completions, budget
-// already expired, this request still pending) passes true and sleeps one
-// poll; that is what keeps the #11 flood off the core. The idle path and
-// wait_request pass false. A sleep there is not watching the fd, so a message
-// that arrives during it waits out the rest of the poll, and wait_request
-// would hold worker_mu_ for that long. They yield and the caller progresses.
-// Callers reap before the throttle, so a request completed by the progress
-// call just made is not parked.
+// not block on the wakeup fd. This function does not sleep on that BUSY.
+// The p2p and collective callers pass true and sleep on the second short
+// return in a row, which is what keeps a flood off the core without hiding
+// the next message behind one leftover event. The idle path passes false
+// and never takes that sleep: a sleep there is not watching the fd.
+//
+// A TCP-only worker does not return BUSY while the fd stays readable, so
+// poll comes back at once. That short return is counted the same way. Callers
+// reap before parking, so a request completed by the progress call just made
+// is not parked.
 void worker_wait_timed(ucp_worker_h worker,
                        const std::chrono::steady_clock::time_point* deadline,
                        bool park_on_busy) {
@@ -113,12 +115,13 @@ void worker_wait_timed(ucp_worker_h worker,
   }
   ucs_status_t s = ucp_worker_arm(worker);
   if (s == UCS_ERR_BUSY) {
-    if (park_on_busy && deadline != nullptr &&
-        !(std::chrono::steady_clock::now() < *deadline)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(wait_poll_ms()));
-    } else {
-      std::this_thread::yield();
-    }
+    // Never sleep here. One BUSY is often the previous completion (the
+    // barrier, or the other request in this Work) and a poll-long sleep
+    // hides the next message. The park_on_busy callers sleep on the second
+    // short return in a row, which a flood produces and a single wakeup does
+    // not. park_on_busy is kept so those callers stay obvious at the call.
+    (void)park_on_busy;
+    std::this_thread::yield();
     return;
   }
   if (s != UCS_OK) {
@@ -134,6 +137,18 @@ void worker_wait_timed(ucp_worker_h worker,
   pfd.fd = efd;
   pfd.events = POLLIN;
   poll(&pfd, 1, wait_poll_ms());
+}
+
+// True when worker_wait_timed already spent about a poll. A TCP flood
+// returns in well under half a poll (the fd is already readable), and the
+// caller then sleeps. Reap before calling this: a completion that arrived
+// during the poll must not pay the sleep.
+bool wait_returned_without_parking(
+    std::chrono::steady_clock::time_point started) {
+  long waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - started)
+                       .count();
+  return waited_ms * 2 < wait_poll_ms();
 }
 
 // CUDA stream-sync is provided by the optional sibling libcommux_cuda.so -- the
@@ -349,6 +364,7 @@ class UCXWork : public c10d::Work {
     // the mutex across a blocking ucp_worker_wait() would serialize, and can
     // deadlock, multi-threaded consumers such as snapy.)
     SpinBudget spin = SpinBudget::start();
+    int hot_fd = 0;
     while (!reap()) {
       if (ucp_worker_progress(worker_)) {
         // Progress may have completed this Work. Reap before parking, or the
@@ -358,9 +374,32 @@ class UCXWork : public c10d::Work {
         // Still pending. Park on BUSY so unrelated completions cannot spin
         // the core for the rest of the wait. Reap above already returned, so
         // this is not a request that completed in the progress call just made.
-        if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), true);
+        // TCP never reports BUSY while its fd is hot; if the wait returned
+        // without blocking, sleep the poll the BUSY path would have slept.
+        if (spin.expired()) {
+          auto parked_at = std::chrono::steady_clock::now();
+          worker_wait_timed(worker_, spin.deadline(), true);
+          if (reap()) break;
+          // A short return is a TCP flood only when progress still has
+          // events afterwards. A stale wakeup (the previous message) has
+          // nothing left: sleeping here would hide the next one for a poll.
+          if (wait_returned_without_parking(parked_at) &&
+              ucp_worker_progress(worker_)) {
+            if (reap()) break;
+            // One stale wakeup is the previous message. A TCP flood keeps
+            // coming back, so the second one in a row is the park.
+            if (++hot_fd >= 2) {
+              std::this_thread::sleep_for(
+                  std::chrono::milliseconds(wait_poll_ms()));
+              hot_fd = 0;
+            }
+          } else {
+            hot_fd = 0;
+          }
+        }
         continue;
       }
+      hot_fd = 0;
       // Idle: arm and poll. On BUSY, progress again instead of sleeping.
       // A sleep here is not watching the wakeup fd, so a message that arrives
       // during it waits out the rest of COMMUX_WAIT_POLL_MS.
@@ -587,6 +626,7 @@ void ProcessGroupUCX::wait_request(void* req) {
   // worker_wait_timed) instead of busy-spinning. Caller holds worker_mu_.
   ucs_status_t st;
   SpinBudget spin = SpinBudget::start();
+  int hot_fd = 0;
   while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
     if (ucp_worker_progress(worker_)) {
       // Same as UCXWork::wait: reap before the deadline park. A completion
@@ -596,10 +636,29 @@ void ProcessGroupUCX::wait_request(void* req) {
       // Unrelated arrivals, request still pending. Park, or this spins a
       // core for the rest of the flood. The re-check above already returned
       // if this progress call completed req, so the collective late-poll
-      // test does not pay this sleep.
-      if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), true);
+      // test does not pay this sleep. Same TCP hole as UCXWork::wait: a
+      // hot fd returns without BUSY, so the second short return sleeps.
+      if (spin.expired()) {
+        auto parked_at = std::chrono::steady_clock::now();
+        worker_wait_timed(worker_, spin.deadline(), true);
+        st = ucp_request_check_status(req);
+        if (st != UCS_INPROGRESS) break;
+        if (wait_returned_without_parking(parked_at) &&
+            ucp_worker_progress(worker_)) {
+          st = ucp_request_check_status(req);
+          if (st != UCS_INPROGRESS) break;
+          if (++hot_fd >= 2) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(wait_poll_ms()));
+            hot_fd = 0;
+          }
+        } else {
+          hot_fd = 0;
+        }
+      }
       continue;
     }
+    hot_fd = 0;
     // Idle, and worker_mu_ is held. On BUSY, yield and progress again. A
     // sleep here is not watching the wakeup fd.
     worker_wait_timed(worker_, spin.deadline(), false);
