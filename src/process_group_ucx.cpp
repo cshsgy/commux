@@ -94,11 +94,18 @@ struct SpinBudget {
 // `deadline` is the end of this wait's whole spin budget. Unrelated
 // completions return early so the caller can reap, and the same deadline is
 // passed back in. A null deadline (COMMUX_SPIN_US unset or 0) does not spin.
-// Once `deadline` is already past, a UCS_ERR_BUSY return must not fall back
-// into a tight progress loop: arm refuses to sleep while events are queued,
-// which is exactly a stream of unrelated completions.
+// `park_on_busy`: UCS_ERR_BUSY means events are already queued, so arm will
+// not block on the wakeup fd. The p2p throttle (unrelated completions, budget
+// already expired, this request still pending) passes true and sleeps one
+// poll; that is what keeps the #11 flood off the core. The idle path and
+// wait_request pass false. A sleep there is not watching the fd, so a message
+// that arrives during it waits out the rest of the poll, and wait_request
+// would hold worker_mu_ for that long. They yield and the caller progresses.
+// Callers reap before the throttle, so a request completed by the progress
+// call just made is not parked.
 void worker_wait_timed(ucp_worker_h worker,
-                       const std::chrono::steady_clock::time_point* deadline) {
+                       const std::chrono::steady_clock::time_point* deadline,
+                       bool park_on_busy) {
   if (deadline != nullptr) {
     while (std::chrono::steady_clock::now() < *deadline) {
       if (ucp_worker_progress(worker)) return;
@@ -106,11 +113,13 @@ void worker_wait_timed(ucp_worker_h worker,
   }
   ucs_status_t s = ucp_worker_arm(worker);
   if (s == UCS_ERR_BUSY) {
-    if (deadline != nullptr &&
+    if (park_on_busy && deadline != nullptr &&
         !(std::chrono::steady_clock::now() < *deadline)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(wait_poll_ms()));
+    } else {
+      std::this_thread::yield();
     }
-    return;  // events arrived during arm -> progress now
+    return;
   }
   if (s != UCS_OK) {
     std::this_thread::yield();  // wakeup unsupported: fall back to a yield
@@ -342,15 +351,22 @@ class UCXWork : public c10d::Work {
     SpinBudget spin = SpinBudget::start();
     while (!reap()) {
       if (ucp_worker_progress(worker_)) {
-        // Advanced. A stream of unrelated completions stays on this branch and
-        // would never consult the one per-wait deadline below.
-        if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+        // Progress may have completed this Work. Reap before parking, or the
+        // deadline check below polls for COMMUX_WAIT_POLL_MS on a request
+        // that is already done.
+        if (reap()) break;
+        // A stream of unrelated completions stays on this branch and would
+        // never consult the one per-wait deadline below.
+        // Still pending. Park on BUSY so unrelated completions cannot spin
+        // the core for the rest of the wait. Reap above already returned, so
+        // this is not a request that completed in the progress call just made.
+        if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), true);
         continue;
       }
-      // Idle: sleep on the worker's wakeup fd, but only until the next event or
-      // a short timeout -- a bounded sleep so concurrently parked threads can't
-      // miss a lost wakeup on the shared worker (see worker_wait_timed).
-      worker_wait_timed(worker_, spin.deadline());
+      // Idle: arm and poll. On BUSY, progress again instead of sleeping.
+      // A sleep here is not watching the wakeup fd, so a message that arrives
+      // during it waits out the rest of COMMUX_WAIT_POLL_MS.
+      worker_wait_timed(worker_, spin.deadline(), false);
     }
     if (err_) {
       std::rethrow_exception(err_);
@@ -575,11 +591,15 @@ void ProcessGroupUCX::wait_request(void* req) {
   SpinBudget spin = SpinBudget::start();
   while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
     if (ucp_worker_progress(worker_)) {
-      // Same budget as UCXWork::wait. Unrelated completions must not skip it.
-      if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+      // Same as UCXWork::wait: reap before the deadline park. A completion
+      // that arrived in this progress call must not wait out a poll.
+      st = ucp_request_check_status(req);
+      if (st != UCS_INPROGRESS) break;
+      if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), false);
       continue;
     }
-    worker_wait_timed(worker_, spin.deadline());
+    // Mutex is held. Do not park on BUSY (park_on_busy false).
+    worker_wait_timed(worker_, spin.deadline(), false);
   }
   ucp_request_free(req);
   TORCH_CHECK(st == UCS_OK, "commux request failed: ", ucs_status_string(st));
