@@ -117,10 +117,11 @@ jobs:
           # after the request has already completed. Poll is 20 ms so one extra
           # park is larger than localhost noise. Rank 0's status is the check.
           export COMMUX_SPIN_US=1000 COMMUX_WAIT_POLL_MS=20 COMMUX_LATE=1
-          ./build/test_commux 1 2 127.0.0.1 29556 &
+          # A rank crash must not hang until the job limit.
+          timeout 300 ./build/test_commux 1 2 127.0.0.1 29556 &
           pid=$!
           set +e
-          ./build/test_commux 0 2 127.0.0.1 29556
+          timeout 300 ./build/test_commux 0 2 127.0.0.1 29556
           status0=$?
           wait "$pid"
           status1=$?

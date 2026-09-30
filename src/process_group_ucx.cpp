@@ -355,8 +355,6 @@ class UCXWork : public c10d::Work {
         // deadline check below polls for COMMUX_WAIT_POLL_MS on a request
         // that is already done.
         if (reap()) break;
-        // A stream of unrelated completions stays on this branch and would
-        // never consult the one per-wait deadline below.
         // Still pending. Park on BUSY so unrelated completions cannot spin
         // the core for the rest of the wait. Reap above already returned, so
         // this is not a request that completed in the progress call just made.
@@ -595,10 +593,15 @@ void ProcessGroupUCX::wait_request(void* req) {
       // that arrived in this progress call must not wait out a poll.
       st = ucp_request_check_status(req);
       if (st != UCS_INPROGRESS) break;
-      if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), false);
+      // Unrelated arrivals, request still pending. Park, or this spins a
+      // core for the rest of the flood. The re-check above already returned
+      // if this progress call completed req, so the collective late-poll
+      // test does not pay this sleep.
+      if (spin.expired()) worker_wait_timed(worker_, spin.deadline(), true);
       continue;
     }
-    // Mutex is held. Do not park on BUSY (park_on_busy false).
+    // Idle, and worker_mu_ is held. On BUSY, yield and progress again. A
+    // sleep here is not watching the wakeup fd.
     worker_wait_timed(worker_, spin.deadline(), false);
   }
   ucp_request_free(req);

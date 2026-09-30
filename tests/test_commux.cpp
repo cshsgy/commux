@@ -589,6 +589,68 @@ int main(int argc, char** argv) {
         }
       }
     }
+
+    // Collective under a p2p flood. wait_request holds worker_mu_. After the
+    // budget, unrelated arrivals on this path used to yield and spin a core;
+    // the #11 park covered only UCXWork::wait. Rank 1 floods, then joins the
+    // allreduce. Rank 0 must stay parked: cpu under half the wall.
+    {
+      const int flood_ms = 40;
+      const int flood_max = 20000;
+      auto usec = [](const timeval& t) {
+        return static_cast<long>(t.tv_sec) * 1000000L +
+               static_cast<long>(t.tv_usec);
+      };
+      if (rank == 0) {
+        pg->barrier()->wait();
+        struct rusage ru0{};
+        struct rusage ru1{};
+        getrusage(RUSAGE_THREAD, &ru0);
+        auto wall0 = std::chrono::steady_clock::now();
+        auto t = torch::zeros({1}, f64);
+        std::vector<at::Tensor> v{t};
+        c10d::AllreduceOptions o;
+        o.reduceOp = c10d::ReduceOp::SUM;
+        pg->allreduce(v, o)->wait();
+        long wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - wall0)
+                           .count();
+        getrusage(RUSAGE_THREAD, &ru1);
+        long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
+                      (usec(ru1.ru_stime) - usec(ru0.ru_stime));
+        int n = static_cast<int>(t[0].item<double>());
+        std::vector<at::Tensor> bufs;
+        std::vector<c10::intrusive_ptr<c10d::Work>> works;
+        for (int j = 0; j < n; ++j) {
+          bufs.push_back(torch::empty({8}, f64));
+          std::vector<at::Tensor> one{bufs.back()};
+          works.push_back(pg->recv(one, peer, 110000 + j));
+        }
+        for (auto& w : works) w->wait();
+        bool parked = cpu_us * 2 < wall_us && wall_us > spin_us;
+        std::printf(
+            "  collective flood: wall %ld us, cpu %ld us, spin %ld us, n %d\n",
+            wall_us, cpu_us, spin_us, n);
+        check(n > 0 && parked,
+              "collective wait parks while unrelated p2p arrivals come in");
+      } else {
+        pg->barrier()->wait();
+        int n = 0;
+        auto end = std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(flood_ms);
+        while (std::chrono::steady_clock::now() < end && n < flood_max) {
+          auto s = torch::full({8}, 1.0, f64);
+          std::vector<at::Tensor> v{s};
+          pg->send(v, peer, 110000 + n)->wait();
+          ++n;
+        }
+        auto t = torch::full({1}, static_cast<double>(n), f64);
+        std::vector<at::Tensor> v{t};
+        c10d::AllreduceOptions o;
+        o.reduceOp = c10d::ReduceOp::SUM;
+        pg->allreduce(v, o)->wait();
+      }
+    }
   }
 
   pg->barrier()->wait();
