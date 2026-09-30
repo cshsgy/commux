@@ -424,6 +424,9 @@ int main(int argc, char** argv) {
       getrusage(RUSAGE_THREAD, &ru0);
       auto wall0 = std::chrono::steady_clock::now();
       flood_work->wait();
+      long done_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
       long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - wall0)
                          .count();
@@ -435,6 +438,7 @@ int main(int argc, char** argv) {
       long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
                     (usec(ru1.ru_stime) - usec(ru0.ru_stime));
       int n = static_cast<int>(flood_got[0].item<double>());
+      long target_late = done_us - std::llround(flood_got[1].item<double>());
       std::vector<at::Tensor> flood_bufs;
       std::vector<c10::intrusive_ptr<c10d::Work>> flood_works;
       if (n > 0) flood_bufs.reserve(static_cast<size_t>(n));
@@ -449,12 +453,19 @@ int main(int argc, char** argv) {
       // A flood that finishes inside the budget cannot fail a full spin.
       bool long_enough = wall_ms + 5 >= flood_ms;
       bool parked = long_enough && cpu_us * 2 < wall_us;
+      const char* poll_env = std::getenv("COMMUX_WAIT_POLL_MS");
+      int poll_ms = poll_env != nullptr ? std::atoi(poll_env) : 1;
+      if (poll_ms <= 0) poll_ms = 1;
       std::printf(
-          "  spin flood: wall %ld ms, cpu %ld us, budget %ld us, n %d\n",
-          wall_ms, cpu_us, budget_us, n);
+          "  spin flood: wall %ld ms, cpu %ld us, budget %ld us, n %d, "
+          "target %ld us, poll %d ms\n",
+          wall_ms, cpu_us, budget_us, n, target_late, poll_ms);
       check(
           n > 0 && parked,
           "bounded spin parks while unrelated completions arrive back to back");
+      // target_late is the stamped target waiting behind the unexpected
+      // queue. One poll between progress calls keeps the core parked, and
+      // that latency grows with the queue, so it is not capped at one poll.
     } else {
       int n = 0;
       auto end = std::chrono::steady_clock::now() +
@@ -465,7 +476,12 @@ int main(int argc, char** argv) {
         pg->send(v, peer, 9500 + n)->wait();
         ++n;
       }
-      auto s = torch::full({8}, static_cast<double>(n), f64);
+      auto s = torch::zeros({8}, f64);
+      s[0] = static_cast<double>(n);
+      s[1] = static_cast<double>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
       std::vector<at::Tensor> v{s};
       pg->send(v, peer, flood_target)->wait();
     }
@@ -530,6 +546,47 @@ int main(int argc, char** argv) {
         auto sent = torch::full({1}, static_cast<double>(steady_us()), f64);
         std::vector<at::Tensor> v{sent};
         pg->send(v, peer, 9700 + i)->wait();
+      }
+    }
+
+    // Collective path. wait_request holds worker_mu_ and does not sleep on
+    // BUSY. A peer that enters allreduce only after the budget has expired
+    // must not pay a poll. Red on 0994e4e, where that BUSY still slept.
+    {
+      const int trials_c = 7;
+      if (rank == 0) {
+        std::vector<long> lates;
+        lates.reserve(static_cast<size_t>(trials_c));
+        for (int i = 0; i < trials_c; ++i) {
+          pg->barrier()->wait();
+          auto t = torch::zeros({1}, f64);
+          std::vector<at::Tensor> v{t};
+          c10d::AllreduceOptions o;
+          o.reduceOp = c10d::ReduceOp::SUM;
+          pg->allreduce(v, o)->wait();
+          long done = steady_us();
+          long sent = std::llround(t[0].item<double>());
+          lates.push_back(done - sent);
+        }
+        std::sort(lates.begin(), lates.end());
+        long median = lates[lates.size() / 2];
+        std::printf(
+            "  collective late: median %ld us, min %ld us, max %ld us, "
+            "poll %d ms, n %d\n",
+            median, lates.front(), lates.back(), poll_ms, trials_c);
+        check(lates.front() > 0 &&
+                  median * 2 < static_cast<long>(poll_ms) * 1000L,
+              "collective wait past the spin budget does not pay a poll");
+      } else {
+        for (int i = 0; i < trials_c; ++i) {
+          pg->barrier()->wait();
+          std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+          auto t = torch::full({1}, static_cast<double>(steady_us()), f64);
+          std::vector<at::Tensor> v{t};
+          c10d::AllreduceOptions o;
+          o.reduceOp = c10d::ReduceOp::SUM;
+          pg->allreduce(v, o)->wait();
+        }
       }
     }
   }
