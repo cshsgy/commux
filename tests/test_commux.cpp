@@ -399,6 +399,74 @@ int main(int argc, char** argv) {
       std::vector<at::Tensor> v{s};
       pg->send(v, peer, target_tag)->wait();
     }
+
+    // Tight unrelated sends, no gap, held for longer than the budget. A short
+    // burst finishes inside the budget and both libraries spin through it.
+    // These recvs are posted only after the target arrives, so during the wait
+    // the messages are unexpected and ucp_worker_progress stays non-zero. The
+    // outer `if (progress) continue` has to read the deadline itself.
+    const int flood_ms = 40;
+    const int flood_max = 20000;
+    const int flood_target = 9400;
+    at::Tensor flood_got;
+    c10::intrusive_ptr<c10d::Work> flood_work;
+    if (rank == 0) {
+      flood_got = torch::empty({8}, f64);
+      std::vector<at::Tensor> tv{flood_got};
+      flood_work = pg->recv(tv, peer, flood_target);
+    }
+    pg->barrier()->wait();
+    if (rank == 0) {
+      struct rusage ru0{};
+      struct rusage ru1{};
+      getrusage(RUSAGE_THREAD, &ru0);
+      auto wall0 = std::chrono::steady_clock::now();
+      flood_work->wait();
+      long wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - wall0)
+                         .count();
+      getrusage(RUSAGE_THREAD, &ru1);
+      auto usec = [](const timeval& t) {
+        return static_cast<long>(t.tv_sec) * 1000000L +
+               static_cast<long>(t.tv_usec);
+      };
+      long cpu_us = (usec(ru1.ru_utime) - usec(ru0.ru_utime)) +
+                    (usec(ru1.ru_stime) - usec(ru0.ru_stime));
+      int n = static_cast<int>(flood_got[0].item<double>());
+      std::vector<at::Tensor> flood_bufs;
+      std::vector<c10::intrusive_ptr<c10d::Work>> flood_works;
+      if (n > 0) flood_bufs.reserve(static_cast<size_t>(n));
+      for (int i = 0; i < n; ++i) {
+        flood_bufs.push_back(torch::empty({8}, f64));
+        std::vector<at::Tensor> v{flood_bufs.back()};
+        flood_works.push_back(pg->recv(v, peer, 9500 + i));
+      }
+      for (auto& w : flood_works) w->wait();
+      long budget_us = std::atol(spin_env);
+      long wall_us = wall_ms * 1000L;
+      // A flood that finishes inside the budget cannot fail a full spin.
+      bool long_enough = wall_ms + 5 >= flood_ms;
+      bool parked = long_enough && cpu_us * 2 < wall_us;
+      std::printf(
+          "  spin flood: wall %ld ms, cpu %ld us, budget %ld us, n %d\n",
+          wall_ms, cpu_us, budget_us, n);
+      check(
+          n > 0 && parked,
+          "bounded spin parks while unrelated completions arrive back to back");
+    } else {
+      int n = 0;
+      auto end = std::chrono::steady_clock::now() +
+                 std::chrono::milliseconds(flood_ms);
+      while (std::chrono::steady_clock::now() < end && n < flood_max) {
+        auto s = torch::full({8}, 1.0, f64);
+        std::vector<at::Tensor> v{s};
+        pg->send(v, peer, 9500 + n)->wait();
+        ++n;
+      }
+      auto s = torch::full({8}, static_cast<double>(n), f64);
+      std::vector<at::Tensor> v{s};
+      pg->send(v, peer, flood_target)->wait();
+    }
   }
 
   pg->barrier()->wait();

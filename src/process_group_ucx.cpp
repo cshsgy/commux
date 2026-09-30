@@ -77,6 +77,9 @@ struct SpinBudget {
   const std::chrono::steady_clock::time_point* deadline() const {
     return on ? &end : nullptr;
   }
+  bool expired() const {
+    return on && !(std::chrono::steady_clock::now() < end);
+  }
   static SpinBudget start() {
     SpinBudget b;
     int us = spin_us();
@@ -91,6 +94,9 @@ struct SpinBudget {
 // `deadline` is the end of this wait's whole spin budget. Unrelated
 // completions return early so the caller can reap, and the same deadline is
 // passed back in. A null deadline (COMMUX_SPIN_US unset or 0) does not spin.
+// Once `deadline` is already past, a UCS_ERR_BUSY return must not fall back
+// into a tight progress loop: arm refuses to sleep while events are queued,
+// which is exactly a stream of unrelated completions.
 void worker_wait_timed(ucp_worker_h worker,
                        const std::chrono::steady_clock::time_point* deadline) {
   if (deadline != nullptr) {
@@ -99,7 +105,13 @@ void worker_wait_timed(ucp_worker_h worker,
     }
   }
   ucs_status_t s = ucp_worker_arm(worker);
-  if (s == UCS_ERR_BUSY) return;  // events arrived during arm -> progress now
+  if (s == UCS_ERR_BUSY) {
+    if (deadline != nullptr &&
+        !(std::chrono::steady_clock::now() < *deadline)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(wait_poll_ms()));
+    }
+    return;  // events arrived during arm -> progress now
+  }
   if (s != UCS_OK) {
     std::this_thread::yield();  // wakeup unsupported: fall back to a yield
     return;
@@ -314,7 +326,12 @@ class UCXWork : public c10d::Work {
     // deadlock, multi-threaded consumers such as snapy.)
     SpinBudget spin = SpinBudget::start();
     while (!reap()) {
-      if (ucp_worker_progress(worker_)) continue;  // advanced; re-check
+      if (ucp_worker_progress(worker_)) {
+        // Advanced. A stream of unrelated completions stays on this branch and
+        // would never consult the one per-wait deadline below.
+        if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+        continue;
+      }
       // Idle: sleep on the worker's wakeup fd, but only until the next event or
       // a short timeout -- a bounded sleep so concurrently parked threads can't
       // miss a lost wakeup on the shared worker (see worker_wait_timed).
@@ -542,7 +559,11 @@ void ProcessGroupUCX::wait_request(void* req) {
   ucs_status_t st;
   SpinBudget spin = SpinBudget::start();
   while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
-    if (ucp_worker_progress(worker_)) continue;
+    if (ucp_worker_progress(worker_)) {
+      // Same budget as UCXWork::wait. Unrelated completions must not skip it.
+      if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+      continue;
+    }
     worker_wait_timed(worker_, spin.deadline());
   }
   ucp_request_free(req);
