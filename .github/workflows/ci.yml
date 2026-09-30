@@ -95,6 +95,8 @@ jobs:
             -C cmake.define.COMMUX_CUDA=OFF .
 
       - name: Smoke import + end-to-end backend tests (CPU, 2-4 ranks)
+        env:
+          UCX_TLS: tcp,sm,self
         run: |
           python -c "import commux; commux.register(); print('commux import OK')"
           torchrun --standalone --nnodes=1 --nproc-per-node=2 tests/test_torch_dist.py
@@ -102,6 +104,8 @@ jobs:
           for n in 3 4; do timeout 120 torchrun --standalone --nnodes=1 --nproc-per-node=$n tests/test_reduce_op.py; done
 
       - name: C++ test (2 ranks over TCPStore)
+        env:
+          UCX_TLS: tcp,sm,self
         run: |
           # COMMUX_MT runs the concurrent multi-threaded send/recv test;
           # COMMUX_DEADLOCK runs the lost-wakeup regression test (many threads
@@ -112,6 +116,8 @@ jobs:
           wait
 
       - name: C++ late-poll regression (2 ranks, spin budget set)
+        env:
+          UCX_TLS: tcp,sm,self
         run: |
           # A wait past COMMUX_SPIN_US must not pay another COMMUX_WAIT_POLL_MS
           # after the request has already completed. Poll is 20 ms so one extra
